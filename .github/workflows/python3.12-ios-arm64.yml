@@ -1,98 +1,207 @@
-name: Build Python 3.12 for iOS (arm64) and package .deb
+name: Build Python 3.12 Rootless iOS deb
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-13
-    timeout-minutes: 30
+    runs-on: macos-15
+    timeout-minutes: 90
+
     concurrency:
-      group: ios-python3.12-arm64-${{ github.ref }}
+      group: ios-python3.12-arm64-rootless-${{ github.ref }}
       cancel-in-progress: true
+
     env:
       PY_VER: 3.12.5
       LIBFFI_VER: 3.4.4
       MIN_IOS: 14.5
-      OPENSSL_BRANCH: OpenSSL_1_1_1-stable  # Used for cache key; actual version pinned in build-openssl.sh
+      OPENSSL_BRANCH: OpenSSL_1_1_1-stable
+      ZLIB_VER: 1.3.1
+      BZIP2_VER: 1.0.8
+      XZ_VER: 5.4.7
 
     steps:
-      # ---------------------------------------------
-      # Checkout repository
-      # ---------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---------------------------------------------
-      # Discover iOS SDK version (for caching/debug)
-      # ---------------------------------------------
       - name: Discover SDK version
         id: sdk
         run: |
+          set -euxo pipefail
           echo "version=$(xcrun --sdk iphoneos --show-sdk-version)" >> "$GITHUB_OUTPUT"
 
-      # ---------------------------------------------
-      # Restore dependency cache (OpenSSL, libffi)
-      # ---------------------------------------------
       - name: Restore deps cache
         uses: actions/cache@v4
         with:
           path: |
             work/deps/openssl-ios
             work/deps/libffi-ios
-          key: ios-${{ runner.os }}-sdk-${{ steps.sdk.outputs.version }}-openssl-${{ env.OPENSSL_BRANCH }}-libffi-${{ env.LIBFFI_VER }}-hash-${{ hashFiles('scripts/*.sh', '.github/workflows/python3.12-ios-arm64.yml') }}
+            work/deps/zlib-ios
+            work/deps/bzip2-ios
+            work/deps/xz-ios
+          key: ios-${{ runner.os }}-sdk-${{ steps.sdk.outputs.version }}-openssl-${{ env.OPENSSL_BRANCH }}-libffi-${{ env.LIBFFI_VER }}-zlib-${{ env.ZLIB_VER }}-bzip2-${{ env.BZIP2_VER }}-xz-${{ env.XZ_VER }}-hash-${{ hashFiles('scripts/*.sh', 'debian/control.in', '.github/workflows/python3.12-ios-arm64.yml') }}
           restore-keys: |
-            ios-${{ runner.os }}-sdk-${{ steps.sdk.outputs.version }}-openssl-${{ env.OPENSSL_BRANCH }}-libffi-${{ env.LIBFFI_VER }}-
+            ios-${{ runner.os }}-sdk-${{ steps.sdk.outputs.version }}-openssl-${{ env.OPENSSL_BRANCH }}-libffi-${{ env.LIBFFI_VER }}-zlib-${{ env.ZLIB_VER }}-bzip2-${{ env.BZIP2_VER }}-xz-${{ env.XZ_VER }}-
             ios-${{ runner.os }}-sdk-${{ steps.sdk.outputs.version }}-
 
-      # ---------------------------------------------
-      # Install required build tools via Homebrew
-      # ---------------------------------------------
       - name: Install build tools
         run: |
+          set -euxo pipefail
           bash scripts/install-build-tools.sh
 
-      # ---------------------------------------------
-      # Prepare host Python 3.12 used by CPython's build
-      # ---------------------------------------------
       - name: Set up Python 3.12 for host build
         id: py
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      # ---------------------------------------------
-      # Build dependencies and CPython, then package .deb
-      # (Behavior identical to previous inline script)
-      # ---------------------------------------------
-      - name: Build Python 3.12 for iOS and package .deb
-        env:
-          PY_VER: 3.12.5
-          LIBFFI_VER: 3.4.4
-          MIN_IOS: 14.5
-          OPENSSL_BRANCH: OpenSSL_1_1_1-stable
+      - name: Show tool versions
         run: |
           set -euxo pipefail
-          # Ensure identical env scope as original inline block
-          source scripts/common-env.sh
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+          clang --version
+          python3 --version
+          "${{ steps.py.outputs.python-path }}" --version
+          command -v gsed
+          gsed --version | head -1
+          command -v ldid
+          dpkg-deb --version | head -1
 
-          # 1) OpenSSL 1.1.1 (stable)
+      - name: Build OpenSSL
+        run: |
+          set -euxo pipefail
           bash scripts/build-openssl.sh
 
-          # 2) libffi (static)
+      - name: Build libffi
+        run: |
+          set -euxo pipefail
           bash scripts/build-libffi.sh
 
-          # 3) CPython 3.12 build and stage (pass host python explicitly)
+      - name: Build compression libraries
+        run: |
+          set -euxo pipefail
+          bash scripts/build-compression-libs.sh
+
+      - name: Build CPython
+        run: |
+          set -euxo pipefail
           PYTHON_FOR_BUILD="${{ steps.py.outputs.python-path }}" bash scripts/build-python.sh
 
-          # 4) .deb packaging
+      - name: Package rootless deb
+        run: |
+          set -euxo pipefail
           bash scripts/package-dpkg.sh
 
-      # ---------------------------------------------
-      # Upload artifact (.deb)
-      # ---------------------------------------------
+      - name: Verify rootless deb layout
+        run: |
+          set -euxo pipefail
+
+          DEB="work/python3.12-rootless_${PY_VER}-1_iphoneos-arm64.deb"
+
+          test -f "$DEB"
+
+          echo "===== Debian metadata ====="
+          dpkg-deb -I "$DEB"
+
+          echo "===== Package content preview ====="
+          dpkg-deb -c "$DEB" > /tmp/deb-content.txt
+          head -200 /tmp/deb-content.txt
+
+          echo "===== Required rootless files ====="
+          grep -F './var/jb/usr/local/bin/python3.12' /tmp/deb-content.txt
+          grep -F './var/jb/usr/local/lib/python3.12/os.py' /tmp/deb-content.txt
+          grep -F './var/jb/usr/local/lib/python3.12/encodings/__init__.py' /tmp/deb-content.txt
+          grep -F './var/jb/etc/profile.d/python3.sh' /tmp/deb-content.txt
+
+          echo "===== Required SSL files ====="
+          grep -F './var/jb/usr/local/etc/ssl/cert.pem' /tmp/deb-content.txt
+          grep -F './var/jb/usr/local/lib/python3.12/lib-dynload/_ssl.' /tmp/deb-content.txt
+          grep -F './var/jb/usr/local/lib/python3.12/lib-dynload/_hashlib.' /tmp/deb-content.txt
+
+          echo "===== Required important extension modules ====="
+          grep -F './var/jb/usr/local/lib/python3.12/lib-dynload/_socket.' /tmp/deb-content.txt
+          grep -F './var/jb/usr/local/lib/python3.12/lib-dynload/select.' /tmp/deb-content.txt
+          grep -F './var/jb/usr/local/lib/python3.12/lib-dynload/fcntl.' /tmp/deb-content.txt
+          grep -F './var/jb/usr/local/lib/python3.12/lib-dynload/mmap.' /tmp/deb-content.txt
+          grep -F './var/jb/usr/local/lib/python3.12/lib-dynload/_ctypes.' /tmp/deb-content.txt
+          grep -F './var/jb/usr/local/lib/python3.12/lib-dynload/_posixsubprocess.' /tmp/deb-content.txt
+
+          echo "===== Required compression extension modules ====="
+          grep -F './var/jb/usr/local/lib/python3.12/lib-dynload/zlib.' /tmp/deb-content.txt
+          grep -F './var/jb/usr/local/lib/python3.12/lib-dynload/_bz2.' /tmp/deb-content.txt
+          grep -F './var/jb/usr/local/lib/python3.12/lib-dynload/_lzma.' /tmp/deb-content.txt
+
+          echo "===== Optional extension modules ====="
+          grep -F './var/jb/usr/local/lib/python3.12/lib-dynload/_sqlite3.' /tmp/deb-content.txt || true
+
+          echo "===== Reject rootful paths ====="
+          if grep -E '^\./usr/|^\./etc/' /tmp/deb-content.txt; then
+            echo "ERROR: rootful paths found in rootless package"
+            exit 1
+          fi
+
+          echo "Info: rootless deb layout verification passed."
+
+      - name: Extract and inspect Mach-O files
+        run: |
+          set -euxo pipefail
+
+          DEB="work/python3.12-rootless_${PY_VER}-1_iphoneos-arm64.deb"
+          EXTRACT_DIR="work/verify-extract"
+
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+
+          dpkg-deb -x "$DEB" "$EXTRACT_DIR"
+
+          PYBIN="$EXTRACT_DIR/var/jb/usr/local/bin/python3.12"
+
+          test -x "$PYBIN"
+
+          echo "===== Python binary file type ====="
+          file "$PYBIN"
+
+          echo "===== Python binary linked libraries ====="
+          otool -L "$PYBIN" || true
+
+          echo "===== Python binary rpaths ====="
+          otool -l "$PYBIN" | grep -A3 LC_RPATH || true
+
+          echo "===== Check important extension modules ====="
+          ls "$EXTRACT_DIR/var/jb/usr/local/lib/python3.12/lib-dynload"/_socket*.so
+          ls "$EXTRACT_DIR/var/jb/usr/local/lib/python3.12/lib-dynload"/_ssl*.so
+          ls "$EXTRACT_DIR/var/jb/usr/local/lib/python3.12/lib-dynload"/_hashlib*.so
+          ls "$EXTRACT_DIR/var/jb/usr/local/lib/python3.12/lib-dynload"/_ctypes*.so
+          ls "$EXTRACT_DIR/var/jb/usr/local/lib/python3.12/lib-dynload"/_posixsubprocess*.so
+          ls "$EXTRACT_DIR/var/jb/usr/local/lib/python3.12/lib-dynload"/zlib*.so
+          ls "$EXTRACT_DIR/var/jb/usr/local/lib/python3.12/lib-dynload"/_bz2*.so
+          ls "$EXTRACT_DIR/var/jb/usr/local/lib/python3.12/lib-dynload"/_lzma*.so
+          ls "$EXTRACT_DIR/var/jb/usr/local/lib/python3.12/lib-dynload"/_sqlite3*.so || echo "WARN: _sqlite3 missing"
+
+          echo "===== Reject bad Mach-O dependency paths ====="
+          BAD=0
+
+          while IFS= read -r f; do
+            if file -b "$f" | grep -q "Mach-O"; then
+              if otool -L "$f" 2>/dev/null | tail -n +2 | grep -E '/Users/runner|/opt/homebrew|/usr/local/Cellar|/usr/local/opt|/usr/local/lib'; then
+                echo "BAD dependency path in $f"
+                otool -L "$f" || true
+                BAD=1
+              fi
+            fi
+          done < <(find "$EXTRACT_DIR/var/jb/usr/local" -type f \( -name '*.so' -o -name '*.dylib' -o -perm +111 \))
+
+          if [ "$BAD" = "1" ]; then
+            echo "ERROR: bad Mach-O dependency paths found"
+            exit 1
+          fi
+
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
-          name: python3.12_${{ env.PY_VER }}_iphoneos-arm
-          path: work/python3.12_${{ env.PY_VER }}-1_iphoneos-arm.deb
+          name: python3.12-rootless_${{ env.PY_VER }}_iphoneos-arm64
+          path: work/python3.12-rootless_${{ env.PY_VER }}-1_iphoneos-arm64.deb
+          if-no-files-found: error

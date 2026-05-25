@@ -7,24 +7,37 @@
 
 set -euxo pipefail
 
-# ------------------------------------------------------------------------------
-# Homebrew Configuration
-# ------------------------------------------------------------------------------
-# Optimize Homebrew to avoid time-consuming updates and cleanup during CI.
 export HOMEBREW_NO_AUTO_UPDATE=1
 export HOMEBREW_NO_INSTALL_CLEANUP=1
 
-# ------------------------------------------------------------------------------
-# Install Dependencies
-# ------------------------------------------------------------------------------
-# List of required formulas
-FORMULAE=(dpkg ldid autoconf automake libtool pkg-config coreutils gnu-sed cmake nasm yasm git wget gpatch)
+FORMULAE=(
+  dpkg
+  ldid-procursus
+  autoconf
+  automake
+  libtool
+  pkg-config
+  coreutils
+  gnu-sed
+  cmake
+  nasm
+  yasm
+  git
+  wget
+  gpatch
+)
 
-# Install only missing formulas
 for f in "${FORMULAE[@]}"; do
-  if brew list --formula | grep -qx "${f}"; then
+  if brew list --formula "${f}" >/dev/null 2>&1; then
     echo "Info: ${f} is already installed. Skipping..."
   else
     brew install "${f}"
   fi
 done
+
+echo "Info: Tool versions"
+command -v dpkg-deb
+command -v ldid
+command -v gsed
+dpkg-deb --version | head -1
+gsed --version | head -1

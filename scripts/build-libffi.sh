@@ -11,21 +11,27 @@ set -euxo pipefail
 # shellcheck disable=SC1091
 source "$(dirname "$0")/common-env.sh"
 
+LIBFFI_PREFIX="$DEPS/libffi-ios"
+LIBFFI_MARKER="$LIBFFI_PREFIX/.ios-no-cfi"
+
 # ------------------------------------------------------------------------------
 # Check for Existing Build
 # ------------------------------------------------------------------------------
-# If the static library already exists, skip the build to save time.
-if [ -f "$DEPS/libffi-ios/usr/local/lib/libffi.a" ]; then
-  echo "Info: libffi already built. Skipping..."
+# Only reuse cache if it was built with CFI disabled.
+if [ -f "$LIBFFI_PREFIX/usr/local/lib/libffi.a" ] && [ -f "$LIBFFI_MARKER" ]; then
+  echo "Info: no-CFI libffi already built. Skipping..."
   exit 0
 fi
 
+rm -rf "$LIBFFI_PREFIX"
+mkdir -p "$DEPS"
 cd "$DEPS"
 
 # ------------------------------------------------------------------------------
 # Download Source
 # ------------------------------------------------------------------------------
-# Download the libffi source tarball with retries to handle network flakiness.
+rm -rf "libffi-${LIBFFI_VER}" "libffi-${LIBFFI_VER}.tar.gz"
+
 for i in 1 2 3 4 5; do
   curl --fail --location --show-error -LO \
     "https://github.com/libffi/libffi/releases/download/v${LIBFFI_VER}/libffi-${LIBFFI_VER}.tar.gz" && break || {
@@ -34,33 +40,71 @@ for i in 1 2 3 4 5; do
   }
 done
 
-# Verify the download was successful
-[ -f "libffi-${LIBFFI_VER}.tar.gz" ] || { echo "Error: libffi tarball missing." >&2; exit 1; }
+[ -f "libffi-${LIBFFI_VER}.tar.gz" ] || {
+  echo "Error: libffi tarball missing." >&2
+  exit 1
+}
 
-# Extract source
 tar xf "libffi-${LIBFFI_VER}.tar.gz"
 cd "libffi-${LIBFFI_VER}"
 
 # ------------------------------------------------------------------------------
-# Configure and Build
+# Configure
 # ------------------------------------------------------------------------------
-# Configure for iOS arm64 cross-compilation.
-# CFLAGS/LDFLAGS/CC are picked up from the environment (exported by common-env.sh).
 ./configure \
   --host="${HOST_TRIPLE}" \
   --prefix=/usr/local \
   --disable-shared \
   --enable-static
 
-# Compile using the number of available CPU cores
+# ------------------------------------------------------------------------------
+# Patch generated config
+# ------------------------------------------------------------------------------
+# Xcode 16.x / iPhoneOS 18.x assembler rejects some libffi 3.4.4 aarch64 CFI
+# expressions. Configure enables HAVE_AS_CFI_PSEUDO_OP, so disable it in the
+# generated config header used by this build.
+echo "===== Disable libffi CFI after configure ====="
+
+CONFIG_H="aarch64-apple-darwin/fficonfig.h"
+test -f "$CONFIG_H"
+
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path("aarch64-apple-darwin/fficonfig.h")
+s = p.read_text()
+
+old = "#define HAVE_AS_CFI_PSEUDO_OP 1"
+new = "/* #undef HAVE_AS_CFI_PSEUDO_OP */"
+
+if old not in s:
+    print("Info: HAVE_AS_CFI_PSEUDO_OP was not enabled in generated fficonfig.h")
+else:
+    s = s.replace(old, new)
+    p.write_text(s)
+    print("Patched generated fficonfig.h: disabled HAVE_AS_CFI_PSEUDO_OP")
+PY
+
+echo "===== Check generated fficonfig.h ====="
+grep -n "HAVE_AS_CFI_PSEUDO_OP" "$CONFIG_H" || true
+
+if grep -q '^#define HAVE_AS_CFI_PSEUDO_OP 1' "$CONFIG_H"; then
+  echo "ERROR: HAVE_AS_CFI_PSEUDO_OP is still enabled in $CONFIG_H" >&2
+  exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Build and Install
+# ------------------------------------------------------------------------------
 make -j"${JOBS}"
 
-# Install to the dependency staging directory
-make install DESTDIR="$DEPS/libffi-ios"
+make install DESTDIR="$LIBFFI_PREFIX"
+
+test -f "$LIBFFI_PREFIX/usr/local/lib/libffi.a"
+touch "$LIBFFI_MARKER"
 
 # ------------------------------------------------------------------------------
 # Cleanup
 # ------------------------------------------------------------------------------
-# Remove source directory and tarball to free up disk space.
 cd "$DEPS"
 rm -rf "libffi-${LIBFFI_VER}" "libffi-${LIBFFI_VER}.tar.gz"
